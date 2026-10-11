@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.cidico.agent-accounts",
+  "name": "Agent Accounts",
+  "version": "1.0.0",
+  "author": "cidico",
+  "license": "MIT",
+  "homepage": "https://github.com/cidico/omarchy-agent-accounts",
+  "description": "Claude Code usage per account (which one to spend now, pace to the weekly reset, 5-hour session) plus Codex and Fireworks, in one bar panel.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Accounts",
+    "description": "Decides which Claude Code account to spend now: weekly headroom, pace to the reset, the 5-hour session, and tokens per day for each account.",
+    "category": "AI",
+    "aliases": [
+      "agent-accounts",
+      "claude-accounts"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "providers": {
+        "claude": {
+          "enabled": true
+        },
+        "codex": {
+          "enabled": true
+        },
+        "fireworks": {
+          "enabled": true
+        }
+      },
+      "refreshIntervalSec": 1800
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 1800
+      }
+    ]
+  }
+}

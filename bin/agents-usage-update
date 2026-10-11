@@ -1,0 +1,754 @@
+#!/usr/bin/python3
+"""Regenerate the agents panel's usage records, with Claude Code per account.
+
+Every agent but Claude goes through Omarchy's own `omarchy-agent-usage-update`.
+Claude gets one record (claude.json) that carries every configured account:
+local token stats come from Omarchy's stock collector, run once per account
+against a "shadow" config dir that holds the transcripts but no credentials,
+so it never touches the network; rate limits come from Anthropic's OAuth usage
+endpoint, at most once per PROBE_MIN_AGE per account.
+
+The limits cache (~/.cache/claude-statusline-usage-<dir name>.json), its lock,
+its failure backoff stamp, and the history log
+(~/.local/state/claude-usage-<dir name>.tsv) use a layout a Claude Code status
+line can share (see extras/claude-statusline.sh), so a status line and this
+widget never query the endpoint for the same account twice.
+
+Arguments mirror omarchy-agent-usage-update: [--force] [--limits-only]
+[--except <agent>]... [agent...], plus --accounts '<json list>' to replace the
+auto-discovered accounts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+HOME = Path.home()
+PLUGIN_ID = "io.github.cidico.agent-accounts"
+# Our own state root, so this plugin can run beside the stock omarchy.agents
+# (which keeps writing ~/.local/state/omarchy/agents/usage) without the two
+# overwriting each other's claude.json. The stock updater is pointed here
+# through XDG_STATE_HOME.
+STATE_ROOT = HOME / ".local" / "state" / PLUGIN_ID
+USAGE_DIR = STATE_ROOT / "omarchy" / "agents" / "usage"
+WORK_ROOT = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / PLUGIN_ID
+STATUSLINE_CACHE = HOME / ".cache"
+HISTORY_DIR = HOME / ".local" / "state"
+USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+STOCK_UPDATE = "omarchy-agent-usage-update"
+STOCK_CLAUDE = "omarchy-agent-usage-claude"
+
+
+PROBE_MIN_AGE = 1800         # seconds a cached payload must age before we query ourselves
+PROBE_MIN_AGE_FORCED = 300   # ... or when someone pressed refresh
+WEEK = 7 * 24 * 3600
+SESSION = 5 * 3600
+ALARM = 0.9
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+# ------------------------------------------------------------------ helpers
+
+
+def now_utc() -> dt.datetime:
+  return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_time(raw: Any) -> dt.datetime | None:
+  text = str(raw or "").strip()
+  if not text:
+    return None
+  try:
+    parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+  except ValueError:
+    return None
+  return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def iso(value: dt.datetime | None) -> str:
+  return value.astimezone(dt.timezone.utc).isoformat() if value else ""
+
+
+def ms(value: dt.datetime | None) -> int:
+  return round(value.timestamp() * 1000) if value else 0
+
+
+def number(value: Any) -> float:
+  try:
+    n = float(value)
+    return n if n == n else 0.0
+  except (TypeError, ValueError):
+    return 0.0
+
+
+def when_label(value: dt.datetime | None) -> str:
+  if not value:
+    return ""
+  local = value.astimezone()
+  return f"{DAY_NAMES[local.weekday()]} {local:%H:%M}"
+
+
+def write_atomic(path: Path, text: str) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".tmp")
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      handle.write(text)
+    os.replace(tmp, path)
+  except BaseException:
+    Path(tmp).unlink(missing_ok=True)
+    raise
+
+
+def read_json(path: Path) -> Any:
+  try:
+    return json.loads(path.read_text(encoding="utf-8"))
+  except (OSError, ValueError):
+    return None
+
+
+# ----------------------------------------------------------------- accounts
+
+
+def discover_accounts() -> list[dict[str, Any]]:
+  """~/.claude plus every ~/.claude-<name> that holds a login.
+
+  `CLAUDE_CONFIG_DIR=~/.claude-work claude` is how a second account usually
+  lives beside the default one; the suffix becomes the account's name.
+  """
+  found = []
+  for path in sorted(HOME.glob(".claude*")):
+    if not path.is_dir() or not (path / ".credentials.json").is_file():
+      continue
+    if path.name == ".claude":
+      found.insert(0, {"id": "default", "name": "Default", "dir": str(path)})
+    elif path.name.startswith(".claude-"):
+      suffix = path.name[len(".claude-"):]
+      found.append({"id": suffix, "name": suffix.replace("-", " ").replace("_", " ").title(), "dir": str(path)})
+  return found or [{"id": "default", "name": "Default", "dir": str(HOME / ".claude")}]
+
+
+def load_accounts(raw: str) -> list[dict[str, Any]]:
+  # The first account also owns pi/omp/opencode sessions that ran on an
+  # Anthropic provider; the stock collector would otherwise count them once
+  # per account.
+  accounts = discover_accounts()
+  if raw:
+    try:
+      parsed = json.loads(raw)
+      if isinstance(parsed, list) and parsed:
+        accounts = parsed
+    except ValueError:
+      print("agents-usage-update: ignoring malformed --accounts", file=sys.stderr)
+  out = []
+  for index, entry in enumerate(accounts):
+    if not isinstance(entry, dict) or not entry.get("id") or not entry.get("dir"):
+      continue
+    real = Path(os.path.expanduser(str(entry["dir"]))).resolve()
+    default_dir = real == (HOME / ".claude").resolve()
+    out.append({
+      "id": re.sub(r"[^A-Za-z0-9_.-]+", "-", str(entry["id"])),
+      "name": str(entry.get("name") or entry["id"]),
+      "dir": real,
+      # The default dir must be launched WITHOUT CLAUDE_CONFIG_DIR: Claude Code
+      # then reads its global config from ~/.claude.json, not <dir>/.claude.json.
+      "launch": ["env", "-u", "CLAUDE_CONFIG_DIR", "claude"] if default_dir
+        else ["env", f"CLAUDE_CONFIG_DIR={real}", "claude"],
+      # Same derivation as extras/claude-statusline.sh: basename of the dir, minus the dot.
+      "cacheKey": real.name.lstrip("."),
+      "ownsExtras": index == 0,
+    })
+  return out
+
+
+def open_sessions() -> dict[str, int]:
+  """Interactive `claude` processes per config dir.
+
+  Tool subprocesses and subagents inherit CLAUDECODE=1; the interactive CLI
+  itself does not, so that variable separates sessions from their children.
+  """
+  counts: dict[str, int] = {}
+  default_dir = str((HOME / ".claude").resolve())
+  for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+      continue
+    try:
+      if (proc / "comm").read_text().strip() != "claude":
+        continue
+      env = dict(item.split("=", 1) for item in (proc / "environ").read_bytes().decode("utf-8", "replace").split("\0") if "=" in item)
+    except OSError:
+      continue
+    if env.get("CLAUDECODE") == "1":
+      continue
+    raw = env.get("CLAUDE_CONFIG_DIR")
+    key = str(Path(raw).expanduser().resolve()) if raw else default_dir
+    counts[key] = counts.get(key, 0) + 1
+  return counts
+
+
+def credentials(real_dir: Path) -> dict[str, Any]:
+  data = read_json(real_dir / ".credentials.json")
+  login = data.get("claudeAiOauth") if isinstance(data, dict) else None
+  if not isinstance(login, dict):
+    return {"token": "", "expiresAtMs": 0, "tier": "", "status": "missing"}
+  tier = ""
+  match = re.search(r"max_(\d+x)", str(login.get("rateLimitTier") or ""), re.IGNORECASE)
+  if match:
+    tier = "Max " + match.group(1)
+  elif login.get("subscriptionType"):
+    sub = str(login["subscriptionType"])
+    tier = sub[:1].upper() + sub[1:]
+  expires = int(number(login.get("expiresAt")))
+  status = "expired" if expires and expires <= time.time() * 1000 else "ok"
+  return {"token": str(login.get("accessToken") or ""), "expiresAtMs": expires, "tier": tier, "status": status}
+
+
+# -------------------------------------------------------------- local stats
+
+
+def shadow_config(account: dict[str, Any]) -> Path:
+  """A config dir with the account's history but none of its credentials.
+
+  The stock collector probes the usage endpoint whenever it finds a live
+  token; without one it reports local stats only, which is all we want.
+  """
+  shadow = WORK_ROOT / account["id"] / "cfg"
+  shadow.mkdir(parents=True, exist_ok=True)
+  for name in ("projects", "stats-cache.json", "history.jsonl"):
+    link, target = shadow / name, account["dir"] / name
+    if link.is_symlink() and os.readlink(link) == str(target):
+      continue
+    if link.is_symlink() or link.exists():
+      link.unlink()
+    if target.exists():
+      link.symlink_to(target)
+  return shadow
+
+
+def collect_stats(account: dict[str, Any], force: bool, reuse: bool) -> dict[str, Any]:
+  stats_file = WORK_ROOT / account["id"] / "stats.json"
+  if reuse:
+    cached = read_json(stats_file)
+    if isinstance(cached, dict):
+      return cached
+
+  env = dict(os.environ)
+  env["CLAUDE_CONFIG_DIR"] = str(shadow_config(account))
+  env["XDG_CACHE_HOME"] = str(WORK_ROOT / account["id"])
+  if not account["ownsExtras"]:
+    empty = WORK_ROOT / account["id"] / "empty"
+    empty.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(empty)            # ~/.pi, ~/.omp
+    env["XDG_DATA_HOME"] = str(empty)   # opencode.db
+  command = [STOCK_CLAUDE] + (["--force"] if force else [])
+  try:
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
+    record = json.loads(result.stdout)
+  except (OSError, subprocess.SubprocessError, ValueError) as exc:
+    print(f"agents-usage-update: stats for {account['id']} failed: {exc}", file=sys.stderr)
+    cached = read_json(stats_file)
+    return cached if isinstance(cached, dict) else {}
+
+  keys = ("todayPrompts", "todaySessions", "todayTotalTokens", "todayTokensByModel", "recentDays",
+          "modelUsage", "totalPrompts", "totalSessions", "activeDays", "activeDates")
+  stats = {key: record.get(key) for key in keys if key in record}
+  write_atomic(stats_file, json.dumps(stats, separators=(",", ":")) + "\n")
+  return stats
+
+
+# ------------------------------------------------------------------- limits
+
+
+def statusline_paths(account: dict[str, Any]) -> dict[str, Path]:
+  base = f"claude-statusline-usage-{account['cacheKey']}"
+  return {
+    "cache": STATUSLINE_CACHE / f"{base}.json",
+    "lock": STATUSLINE_CACHE / f"{base}.lock",
+    "attempt": STATUSLINE_CACHE / f"{base}.attempt",
+    "history": HISTORY_DIR / f"claude-usage-{account['cacheKey']}.tsv",
+  }
+
+
+def tsv_number(value: Any) -> str:
+  if value is None:
+    return ""
+  if isinstance(value, float) and value.is_integer():
+    return str(int(value))
+  return str(value)
+
+
+def log_usage(payload: dict[str, Any], history: Path) -> None:
+  """Append one history row exactly like statusline-command.sh's log_usage."""
+  limits = [entry for entry in payload.get("limits") or [] if isinstance(entry, dict)]
+
+  def first(predicate) -> dict[str, Any]:
+    return next((entry for entry in limits if predicate(entry)), {})
+
+  session = first(lambda e: e.get("kind") == "session")
+  weekly = first(lambda e: e.get("kind") == "weekly_all")
+  fable = first(lambda e: e.get("kind") == "weekly_scoped"
+                and ((e.get("scope") or {}).get("model") or {}).get("display_name") == "Fable")
+  row = "\t".join([
+    tsv_number(session.get("percent")),
+    tsv_number(weekly.get("percent")),
+    tsv_number(fable.get("percent")),
+    str(weekly.get("resets_at") or "")[:16],
+  ])
+  history.parent.mkdir(parents=True, exist_ok=True)
+  last = ""
+  if history.exists():
+    with history.open("r", encoding="utf-8", errors="replace") as handle:
+      for line in handle:
+        last = line.rstrip("\n")
+  else:
+    history.write_text("time\tsession_pct\tweekly_pct\tfable_weekly_pct\tweekly_resets_at\n", encoding="utf-8")
+  if last.split("\t", 1)[-1] != row:
+    stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    with history.open("a", encoding="utf-8") as handle:
+      handle.write(f"{stamp}\t{row}\n")
+
+
+def attempt_blocked(attempt: Path) -> bool:
+  try:
+    at, backoff = (attempt.read_text().split() + ["0", "60"])[:2]
+    return time.time() - float(at) < float(backoff)
+  except (OSError, ValueError):
+    return False
+
+
+def maybe_probe(account: dict[str, Any], token: str, force: bool) -> None:
+  paths = statusline_paths(account)
+  min_age = PROBE_MIN_AGE_FORCED if force else PROBE_MIN_AGE
+
+  def due() -> bool:
+    cache = paths["cache"]
+    if cache.exists() and time.time() - cache.stat().st_mtime <= min_age:
+      return False
+    return not attempt_blocked(paths["attempt"])
+
+  if not token or not due():
+    return
+  paths["lock"].parent.mkdir(parents=True, exist_ok=True)
+  with paths["lock"].open("a") as lock:
+    try:
+      fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+      return  # the status line is fetching right now
+    if not due():
+      return
+    request = urllib.request.Request(USAGE_ENDPOINT, headers={
+      "Authorization": "Bearer " + token,
+      "anthropic-beta": "oauth-2025-04-20",
+      "User-Agent": "claude-code",
+      "Accept": "application/json",
+    })
+    code = 0
+    payload = None
+    try:
+      with urllib.request.urlopen(request, timeout=5) as response:
+        code = response.status
+        payload = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as error:
+      code = error.code
+    except (OSError, ValueError):
+      code = 0
+    if code == 200 and isinstance(payload, dict) and "limits" in payload:
+      write_atomic(paths["cache"], json.dumps(payload))
+      log_usage(payload, paths["history"])
+      paths["attempt"].unlink(missing_ok=True)
+      return
+    backoff = 60
+    if code == 429:
+      try:
+        backoff = min(600, max(60, int(float(paths["attempt"].read_text().split()[1]) * 2)))
+      except (OSError, ValueError, IndexError):
+        backoff = 60
+    paths["attempt"].write_text(f"{int(time.time())} {backoff}\n")
+
+
+def payload_limits(payload: dict[str, Any], now: dt.datetime) -> list[dict[str, Any]]:
+  """The status line's raw payload as the panel's limits[], rolled past resets.
+
+  A window whose reset has passed since the payload was fetched describes a
+  period that is over. Weekly windows run on a fixed cadence, so they roll
+  forward to a fresh 0%; a session window only starts with the next prompt.
+  """
+  out = []
+  entries = [entry for entry in payload.get("limits") or [] if isinstance(entry, dict)]
+  if not entries:
+    for key, kind in (("five_hour", "session"), ("seven_day", "weekly_all")):
+      bucket = payload.get(key)
+      if isinstance(bucket, dict) and bucket.get("utilization") is not None:
+        entries.append({"kind": kind, "percent": bucket.get("utilization"), "resets_at": bucket.get("resets_at")})
+  for entry in entries:
+    kind = str(entry.get("kind") or "")
+    model = ((entry.get("scope") or {}).get("model") or {})
+    model_name = str(model.get("display_name") or model.get("id") or "").strip()
+    if kind == "session":
+      label, title, span = "Session (5-hour)", "Session", SESSION
+    elif kind == "weekly_all":
+      label, title, span = "Weekly (7-day)", "Weekly", WEEK
+    elif kind == "weekly_scoped" and model_name:
+      label = title = f"{model_name} Weekly"
+      span = WEEK
+    else:
+      continue
+    percent = min(1.0, max(0.0, number(entry.get("percent")) / 100.0))
+    resets = parse_time(entry.get("resets_at"))
+    rolled = False
+    if resets and resets <= now:
+      rolled = True
+      percent = 0.0
+      if span == WEEK:
+        while resets <= now:
+          resets += dt.timedelta(seconds=WEEK)
+      else:
+        resets = None
+    out.append({
+      "kind": kind,
+      "model": model_name,
+      "label": label,
+      "title": title,
+      "percent": round(percent, 4),
+      "resetsAt": iso(resets),
+      "windowSeconds": span,
+      "rolled": rolled,
+    })
+  return out
+
+
+# --------------------------------------------------------------------- pace
+
+
+def history_points(path: Path) -> list[tuple[dt.datetime, float, dt.datetime | None]]:
+  points = []
+  try:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+      next(handle, None)
+      for line in handle:
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) < 5 or cols[2] == "":
+          continue
+        when = parse_time(cols[0])
+        # weekly_resets_at is the payload's UTC timestamp cut to minutes.
+        reset = parse_time(cols[4] + "+00:00") if cols[4] else None
+        if when:
+          points.append((when, number(cols[2]) / 100.0, reset))
+  except OSError:
+    pass
+  return points
+
+
+def pace(weekly: dict[str, Any] | None, history: Path, fetched_at: dt.datetime | None, now: dt.datetime) -> dict[str, Any] | None:
+  if not weekly or not weekly.get("resetsAt"):
+    return None
+  resets = parse_time(weekly["resetsAt"])
+  start = resets - dt.timedelta(seconds=WEEK)
+  span_h = WEEK / 3600
+  elapsed_h = min(span_h, max(0.0, (now - start).total_seconds() / 3600))
+  left_h = max(0.0, (resets - now).total_seconds() / 3600)
+  percent = number(weekly.get("percent"))
+
+  # Same window = a logged reset within 10 minutes of this one (the endpoint
+  # jitters the second, so "04:59" and "05:00" are one window).
+  points = [(when, value) for when, value, reset in history_points(history)
+            if reset and abs((reset - resets).total_seconds()) <= 600 and when >= start]
+  end = min(now, fetched_at or now)
+  lookback = end - dt.timedelta(hours=24)
+  rate = None
+  if points and not weekly.get("rolled"):
+    if lookback <= start:
+      anchor_t, anchor_v = start, 0.0
+    else:
+      before = [(when, value) for when, value in points if when <= lookback]
+      anchor_t, anchor_v = (lookback, before[-1][1]) if before else (start, 0.0)
+    hours = (end - anchor_t).total_seconds() / 3600
+    if hours > 0.25:
+      rate = max(0.0, (percent - anchor_v) / hours)
+  if rate is None:
+    hours = max(0.25, (end - start).total_seconds() / 3600)
+    rate = percent / hours if elapsed_h > 0 else 0.0
+
+  series = [[round((when - start).total_seconds() / WEEK, 4), round(value, 4)] for when, value in points]
+  if len(series) > 120:
+    step = (len(series) - 1) / 119
+    series = [series[round(i * step)] for i in range(120)]
+  return {
+    "windowStartMs": ms(start),
+    "resetsAtMs": ms(resets),
+    "elapsedFraction": round(elapsed_h / span_h, 4),
+    "ratePerHour": round(rate, 6),
+    "projectedAtReset": round(min(1.0, percent + rate * left_h), 4),
+    "dailyBudget": round((1 - percent) / (left_h / 24), 4) if left_h > 0 else 0.0,
+    "series": series,
+  }
+
+
+def scan_window(projects: Path, start: dt.datetime) -> int:
+  """Tokens in Claude Code transcripts stamped at or after `start`.
+
+  The stock collector only buckets by calendar day, and a weekly window opens
+  mid-day (sex 15:59), so the reset's own day would land wholly on one side.
+  Only files touched since the window opened can hold its messages.
+  """
+  floor = start.timestamp()
+  seen: set[str] = set()
+  total = 0
+  for path in projects.rglob("*.jsonl") if projects.is_dir() else []:
+    try:
+      if path.stat().st_mtime < floor:
+        continue
+      with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+          if '"usage":' not in line:
+            continue
+          try:
+            entry = json.loads(line)
+          except ValueError:
+            continue
+          message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+          if entry.get("type") != "assistant" and message.get("role") != "assistant":
+            continue
+          usage = message.get("usage") or entry.get("usage")
+          when = parse_time(entry.get("timestamp") or message.get("timestamp"))
+          if not isinstance(usage, dict) or not when or when < start:
+            continue
+          key = str(message.get("id") or entry.get("uuid") or "")
+          if key:
+            if key in seen:
+              continue
+            seen.add(key)
+          total += sum(int(number(usage.get(field))) for field in (
+            "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    except OSError:
+      continue
+  return total
+
+
+def window_tokens(account: dict[str, Any], recent_days: list[dict[str, Any]], window_start_ms: int, reuse: bool) -> dict[str, Any]:
+  if not window_start_ms:
+    return {"tokensInWindow": 0, "tokensPreviousWindow": 0}
+  cache = WORK_ROOT / account["id"] / "window.json"
+  cached = read_json(cache)
+  fresh = isinstance(cached, dict) and abs(int(number(cached.get("windowStartMs"))) - window_start_ms) < 600_000
+  if fresh and (reuse or time.time() - cache.stat().st_mtime < 60):
+    inside = int(number(cached.get("tokens")))
+  else:
+    start = dt.datetime.fromtimestamp(window_start_ms / 1000, dt.timezone.utc)
+    inside = scan_window(account["dir"] / "projects", start)
+    write_atomic(cache, json.dumps({"windowStartMs": window_start_ms, "tokens": inside}) + "\n")
+  # The rest of the visible week belongs to the window before the reset.
+  week = sum(int(number(day.get("messageCount"))) for day in recent_days)
+  return {"tokensInWindow": inside, "tokensPreviousWindow": max(0, week - inside)}
+
+
+# ------------------------------------------------------------------- record
+
+
+def build_account(account: dict[str, Any], sessions: dict[str, int], args: argparse.Namespace, now: dt.datetime) -> dict[str, Any]:
+  creds = credentials(account["dir"])
+  if creds["status"] == "ok":
+    maybe_probe(account, creds["token"], args.force)
+
+  paths = statusline_paths(account)
+  payload = read_json(paths["cache"])
+  fetched_at = None
+  limits: list[dict[str, Any]] = []
+  if isinstance(payload, dict):
+    fetched_at = dt.datetime.fromtimestamp(paths["cache"].stat().st_mtime, dt.timezone.utc)
+    limits = payload_limits(payload, now)
+
+  stats = collect_stats(account, args.force, reuse=args.limits_only)
+  weekly = next((limit for limit in limits if limit["kind"] == "weekly_all"), None)
+  session = next((limit for limit in limits if limit["kind"] == "session"), None)
+  account_pace = pace(weekly, paths["history"], fetched_at, now)
+
+  session_info = None
+  if session:
+    resets = parse_time(session["resetsAt"])
+    elapsed = 0.0
+    if resets:
+      elapsed = min(1.0, max(0.0, 1 - (resets - now).total_seconds() / SESSION))
+    session_info = {"percent": session["percent"], "resetsAt": session["resetsAt"], "elapsedFraction": round(elapsed, 4)}
+
+  entry = {
+    "id": account["id"],
+    "name": account["name"],
+    "dir": str(account["dir"]),
+    "launch": account["launch"],
+    "tierLabel": creds["tier"],
+    "authStatus": creds["status"],
+    "authExpiresAtMs": creds["expiresAtMs"],
+    "openSessions": sessions.get(str(account["dir"]), 0),
+    "limits": limits,
+    "limitsFetchedAtMs": ms(fetched_at),
+    "weekly": weekly,
+    "session": session_info,
+    "pace": account_pace,
+    "recentDays": stats.get("recentDays") or [],
+    "modelUsage": stats.get("modelUsage") or {},
+    "todayTotalTokens": int(number(stats.get("todayTotalTokens"))),
+    "totalPrompts": int(number(stats.get("totalPrompts"))),
+    "_stats": stats,
+  }
+  entry.update(window_tokens(account, entry["recentDays"], account_pace["windowStartMs"] if account_pace else 0, args.limits_only))
+  return entry
+
+
+def recommend(accounts: list[dict[str, Any]]) -> tuple[str, bool, str]:
+  known = [a for a in accounts if a["weekly"]]
+  if not known:
+    first = next((a for a in accounts if a["authStatus"] == "ok"), accounts[0] if accounts else None)
+    return (first["id"] if first else "", False, "No limits cached yet: open an account so the panel can learn them.")
+
+  def peak(a: dict[str, Any]) -> float:
+    return max((limit["percent"] for limit in a["limits"]), default=0.0)
+
+  def free(a: dict[str, Any]) -> float:
+    return 1 - a["weekly"]["percent"]
+
+  def reset(a: dict[str, Any]) -> dt.datetime:
+    return parse_time(a["weekly"]["resetsAt"]) or now_utc()
+
+  eligible = sorted((a for a in known if peak(a) < ALARM), key=lambda a: (reset(a), -free(a)))
+  if not eligible:
+    best = min(known, key=lambda a: (a["weekly"]["percent"], reset(a)))
+    return best["id"], True, f"Every account is above 90%. {best['name']} frees up first, {when_label(reset(best))}."
+
+  pick = eligible[0]
+  others = [a for a in accounts if a is not pick]
+  blocked = [a for a in others if a["weekly"] and peak(a) >= ALARM]
+  head = f"{round(free(pick) * 100)}% left"
+  if blocked:
+    worst = blocked[0]
+    window = max(worst["limits"], key=lambda limit: limit["percent"])
+    return pick["id"], False, f"{head}. {worst['name']} is at {round(window['percent'] * 100)}% on its {window['title'].lower()} limit."
+  rivals = [a for a in others if a["weekly"]]
+  if rivals and (reset(rivals[0]) - reset(pick)).total_seconds() > 3600:
+    other = rivals[0]
+    return pick["id"], False, f"{head} and it resets first, {when_label(reset(pick))}. {other['name']} runs until {when_label(reset(other))}."
+  if rivals:
+    other = rivals[0]
+    return pick["id"], False, f"{head} against {round(free(other) * 100)}% on {other['name']}; both reset together."
+  return pick["id"], False, f"{head}, resets {when_label(reset(pick))}."
+
+
+def merge_stats(accounts: list[dict[str, Any]]) -> dict[str, Any]:
+  merged: dict[str, Any] = {
+    "todayPrompts": 0, "todaySessions": 0, "todayTotalTokens": 0, "totalPrompts": 0, "totalSessions": 0,
+    "todayTokensByModel": {}, "modelUsage": {}, "recentDays": [], "activeDates": [], "activeDays": 0,
+  }
+  by_date: dict[str, int] = {}
+  dates: set[str] = set()
+  for account in accounts:
+    stats = account["_stats"]
+    for key in ("todayPrompts", "todaySessions", "todayTotalTokens", "totalPrompts", "totalSessions"):
+      merged[key] += int(number(stats.get(key)))
+    for model, count in (stats.get("todayTokensByModel") or {}).items():
+      merged["todayTokensByModel"][model] = merged["todayTokensByModel"].get(model, 0) + int(number(count))
+    for model, bucket in (stats.get("modelUsage") or {}).items():
+      target = merged["modelUsage"].setdefault(model, {})
+      for field, count in (bucket or {}).items():
+        target[field] = target.get(field, 0) + int(number(count))
+    for day in stats.get("recentDays") or []:
+      date = str((day or {}).get("date") or "")
+      if date:
+        by_date[date] = by_date.get(date, 0) + int(number(day.get("messageCount")))
+    dates |= set(stats.get("activeDates") or [])
+    merged["activeDays"] = max(merged["activeDays"], int(number(stats.get("activeDays"))))
+  merged["recentDays"] = [{"date": date, "messageCount": by_date[date]} for date in sorted(by_date)]
+  merged["activeDates"] = sorted(dates)
+  merged["activeDays"] = max(merged["activeDays"], len(dates))
+  return merged
+
+
+def claude_record(args: argparse.Namespace) -> dict[str, Any]:
+  now = now_utc()
+  sessions = open_sessions()
+  accounts = [build_account(account, sessions, args, now) for account in load_accounts(args.accounts)]
+  recommended, exhausted, reason = recommend(accounts)
+  pick = next((a for a in accounts if a["id"] == recommended), None)
+
+  problems = [a for a in accounts if not a["weekly"]]
+  status_text = help_text = ""
+  if accounts and len(problems) == len(accounts):
+    status_text = "Limits unavailable"
+    help_text = "No account has cached limits yet. Open a Claude Code session so the status line can fetch them."
+
+  record = {
+    "schemaVersion": 1,
+    "id": "claude",
+    "name": "Claude Code",
+    "updatedAt": iso(now),
+    "hasLocalStats": True,
+    "tierLabel": pick["tierLabel"] if pick else "",
+    "usageStatusText": status_text,
+    "authHelpText": help_text,
+    "limits": [{k: v for k, v in limit.items() if k in ("label", "title", "percent", "resetsAt")} for limit in (pick["limits"] if pick else [])],
+    "recommended": recommended,
+    "allExhausted": exhausted,
+    "recommendationReason": reason,
+  }
+  record.update(merge_stats(accounts))
+  record["ready"] = record["totalPrompts"] > 0 or any(a["limits"] for a in accounts)
+  record["accounts"] = [{k: v for k, v in a.items() if k != "_stats"} for a in accounts]
+  return record
+
+
+# --------------------------------------------------------------------- main
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  parser.add_argument("--except", dest="excluded", action="append", default=[])
+  parser.add_argument("--accounts", default="")
+  parser.add_argument("--print", action="store_true", help="print the Claude record instead of writing it")
+  parser.add_argument("agents", nargs="*")
+  args = parser.parse_args()
+
+  flags = (["--force"] if args.force else []) + (["--limits-only"] if args.limits_only else [])
+  wants_claude = "claude" not in args.excluded and (not args.agents or "claude" in args.agents)
+  others = [agent for agent in args.agents if agent != "claude"]
+
+  stock = None
+  if not args.print and (not args.agents or others):
+    command = [STOCK_UPDATE, *flags, "--except", "claude"]
+    for agent in args.excluded:
+      command += ["--except", agent]
+    stock = subprocess.Popen(command + others, env=dict(os.environ, XDG_STATE_HOME=str(STATE_ROOT)))
+
+  status = 0
+  if wants_claude:
+    try:
+      record = claude_record(args)
+      text = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
+      if args.print:
+        sys.stdout.write(text)
+      else:
+        write_atomic(USAGE_DIR / "claude.json", text)
+    except Exception as exc:  # one bad account must not take the other agents down
+      print(f"agents-usage-update: claude record failed: {exc!r}", file=sys.stderr)
+      status = 1
+
+  if stock is not None and stock.wait() != 0:
+    status = 1
+  return status
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
