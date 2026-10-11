@@ -117,8 +117,25 @@ Item {
   // The first refresh can fire before the bar hands over this widget's
   // settings; an account list arriving (or changing) later deserves a rerun
   // rather than half an hour under the auto-discovered names.
-  readonly property string accountsKey: JSON.stringify(setting("accounts", null))
+  readonly property string accountsKey: JSON.stringify(accountsSetting())
   onAccountsKeyChanged: runUpdate("limits")
+
+  // shell.json lists reach QML as sequence wrappers that Array.isArray
+  // rejects, so copy the entries into a plain array (as the bar's own
+  // Indicators widget does).
+  function accountsSetting() {
+    var raw = setting("accounts", null)
+    var out = []
+    if (!raw || typeof raw.length !== "number") return out
+    for (var i = 0; i < raw.length; i++) {
+      try {
+        var entry = JSON.parse(JSON.stringify(raw[i]))
+        if (entry && typeof entry === "object") out.push(entry)
+      } catch (e) {
+      }
+    }
+    return out
+  }
 
   Timer {
     interval: root.refreshIntervalSec * 1000
@@ -154,8 +171,8 @@ Item {
     for (var id in providers) {
       if (providers[id] && providers[id].enabled === false) command.push("--except", id)
     }
-    var accounts = setting("accounts", null)
-    if (Array.isArray(accounts) && accounts.length > 0) command.push("--accounts", JSON.stringify(accounts))
+    var accounts = accountsSetting()
+    if (accounts.length > 0) command.push("--accounts", JSON.stringify(accounts))
     if (agentIds) {
       for (var i = 0; i < agentIds.length; i++) command.push(agentIds[i])
     }
