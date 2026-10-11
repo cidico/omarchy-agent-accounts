@@ -114,6 +114,12 @@ Item {
   property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 1800)))
   property string pendingUpdateKind: ""
 
+  // The first refresh can fire before the bar hands over this widget's
+  // settings; an account list arriving (or changing) later deserves a rerun
+  // rather than half an hour under the auto-discovered names.
+  readonly property string accountsKey: JSON.stringify(setting("accounts", null))
+  onAccountsKeyChanged: runUpdate("limits")
+
   Timer {
     interval: root.refreshIntervalSec * 1000
     running: true
