@@ -497,8 +497,8 @@ def pace(weekly: dict[str, Any] | None, history: Path, fetched_at: dt.datetime |
   }
 
 
-def scan_window(projects: Path, start: dt.datetime) -> int:
-  """Tokens in Claude Code transcripts stamped at or after `start`.
+def scan_window(projects: Path, start: dt.datetime) -> dict[str, int]:
+  """Tokens per model in Claude Code transcripts stamped at or after `start`.
 
   The stock collector only buckets by calendar day, and a weekly window opens
   mid-day (sex 15:59), so the reset's own day would land wholly on one side.
@@ -506,7 +506,7 @@ def scan_window(projects: Path, start: dt.datetime) -> int:
   """
   floor = start.timestamp()
   seen: set[str] = set()
-  total = 0
+  by_model: dict[str, int] = {}
   for path in projects.rglob("*.jsonl") if projects.is_dir() else []:
     try:
       if path.stat().st_mtime < floor:
@@ -531,28 +531,33 @@ def scan_window(projects: Path, start: dt.datetime) -> int:
             if key in seen:
               continue
             seen.add(key)
-          total += sum(int(number(usage.get(field))) for field in (
+          model = str(message.get("model") or "unknown")
+          if model == "<synthetic>":
+            continue
+          by_model[model] = by_model.get(model, 0) + sum(int(number(usage.get(field))) for field in (
             "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
     except OSError:
       continue
-  return total
+  return by_model
 
 
 def window_tokens(account: dict[str, Any], recent_days: list[dict[str, Any]], window_start_ms: int, reuse: bool) -> dict[str, Any]:
   if not window_start_ms:
-    return {"tokensInWindow": 0, "tokensPreviousWindow": 0}
+    return {"tokensInWindow": 0, "tokensPreviousWindow": 0, "windowModelTokens": {}}
   cache = WORK_ROOT / account["id"] / "window.json"
   cached = read_json(cache)
-  fresh = isinstance(cached, dict) and abs(int(number(cached.get("windowStartMs"))) - window_start_ms) < 600_000
+  fresh = (isinstance(cached, dict) and isinstance(cached.get("byModel"), dict)
+           and abs(int(number(cached.get("windowStartMs"))) - window_start_ms) < 600_000)
   if fresh and (reuse or time.time() - cache.stat().st_mtime < 60):
-    inside = int(number(cached.get("tokens")))
+    by_model = {str(k): int(number(v)) for k, v in cached["byModel"].items()}
   else:
     start = dt.datetime.fromtimestamp(window_start_ms / 1000, dt.timezone.utc)
-    inside = scan_window(account["dir"] / "projects", start)
-    write_atomic(cache, json.dumps({"windowStartMs": window_start_ms, "tokens": inside}) + "\n")
+    by_model = scan_window(account["dir"] / "projects", start)
+    write_atomic(cache, json.dumps({"windowStartMs": window_start_ms, "byModel": by_model}) + "\n")
+  inside = sum(by_model.values())
   # The rest of the visible week belongs to the window before the reset.
   week = sum(int(number(day.get("messageCount"))) for day in recent_days)
-  return {"tokensInWindow": inside, "tokensPreviousWindow": max(0, week - inside)}
+  return {"tokensInWindow": inside, "tokensPreviousWindow": max(0, week - inside), "windowModelTokens": by_model}
 
 
 # ------------------------------------------------------------------- record

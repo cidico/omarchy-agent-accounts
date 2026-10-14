@@ -31,8 +31,9 @@ its leftover allowance is not wasted.
   over it runs dry before the reset.
 - **Tokens by day**: every account on one chart, with each weekly reset marked
   where it fell.
-- Top models, model-scoped weekly limits (e.g. `Fable weekly: P 3% · W 21%`), and
-  **Open** buttons that launch Claude Code on a given account.
+- **Tokens by model**: each model's tokens in every account's current weekly
+  window, with the total across accounts, and model-scoped weekly limits
+  (e.g. `Fable weekly: P 3% · W 21%`).
 
 Codex and Fireworks keep the stock Omarchy view under their own tabs.
 

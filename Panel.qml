@@ -145,7 +145,9 @@ Panel {
 
   function launchAccount(acc) {
     if (!acc || !Array.isArray(acc.launch) || acc.launch.length === 0) return
-    Util.execArgv(["omarchy-launch-tui", "--app-id=org.omarchy.agent"].concat(acc.launch).concat(["--permission-mode", "auto"]))
+    // No permission flag: each account's own settings.json decides, the same
+    // as running `claude` by hand.
+    Util.execArgv(["omarchy-launch-tui", "--app-id=org.omarchy.agent"].concat(acc.launch))
     root.close()
   }
 
@@ -182,14 +184,6 @@ Panel {
     return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
-  // The recommended account first: it gets the solid button.
-  function launchOrder() {
-    var first = recommendedAccount
-    var out = first ? [first] : []
-    for (var i = 0; i < accounts.length; i++) if (accounts[i] !== first) out.push(accounts[i])
-    return out
-  }
-
   function windowTokensTooltip() {
     var parts = []
     for (var i = 0; i < accounts.length; i++) {
@@ -202,8 +196,8 @@ Panel {
 
   // ---------------------------------------------------------------- charts
 
-  function canvasFont(bold) {
-    return (bold ? "bold " : "") + Style.font.caption + "px \"" + root.fontFamily + "\""
+  function canvasFont(bold, size) {
+    return (bold ? "bold " : "") + (size || Style.font.caption) + "px \"" + root.fontFamily + "\""
   }
 
   function dashLine(ctx, x1, y1, x2, y2, dash, gap) {
@@ -225,18 +219,19 @@ Panel {
   // left over at the reset; over it, the account runs dry first.
   function paintPace(ctx, w, h, accts) {
     ctx.reset()
-    var fs = Style.font.caption
-    var left = Style.space(34), right = Style.space(4), top = Style.space(12), bottom = Style.space(20)
+    // Sized to be read at a glance: body-size labels, a taller plot.
+    var fs = Style.font.body
+    var left = Style.space(42), right = Style.space(6), top = Style.space(18), bottom = Style.space(26)
     var pw = Math.max(1, w - left - right), ph = Math.max(1, h - top - bottom)
     function X(f) { return left + pw * root.clamp(f, 0, 1) }
     function Y(p) { return top + ph * (1 - root.clamp(p, 0, 1)) }
 
-    ctx.font = canvasFont(false)
+    ctx.font = canvasFont(false, fs)
     ctx.textBaseline = "middle"
     ctx.lineWidth = 1
-    var grid = [[0, "0"], [0.5, "50%"], [1, "100%"]]
+    var grid = [[0, "0"], [0.25, "25%"], [0.5, "50%"], [0.75, "75%"], [1, "100%"]]
     for (var g = 0; g < grid.length; g++) {
-      ctx.strokeStyle = css(root.foreground, grid[g][0] === 0 ? 0.16 : 0.08)
+      ctx.strokeStyle = css(root.foreground, grid[g][0] === 0 ? 0.2 : 0.1)
       if (grid[g][0] === 0) {
         ctx.beginPath(); ctx.moveTo(left, Y(0)); ctx.lineTo(left + pw, Y(0)); ctx.stroke()
       } else {
@@ -249,9 +244,14 @@ Panel {
 
     ctx.strokeStyle = css(root.foreground, 0.32)
     dashLine(ctx, X(0), Y(0), X(1), Y(1), 4, 4)
-    ctx.fillStyle = css(root.foreground, 0.4)
-    ctx.textAlign = "right"
-    ctx.fillText("linear pace", X(0.7), Y(0.86))
+    // Written along the diagonal, just under it, so it never sits on a curve's label.
+    ctx.save()
+    ctx.translate(X(0.62), Y(0.62))
+    ctx.rotate(Math.atan2(-ph, pw))
+    ctx.fillStyle = css(root.foreground, 0.45)
+    ctx.textAlign = "center"
+    ctx.fillText("linear pace", 0, fs * 0.9)
+    ctx.restore()
 
     var labels = []
     for (var i = 0; i < accts.length; i++) {
@@ -265,7 +265,7 @@ Panel {
       pts.push([ef, now])
 
       ctx.strokeStyle = css(color)
-      ctx.lineWidth = 2.5
+      ctx.lineWidth = 3
       ctx.lineJoin = "round"
       ctx.lineCap = "round"
       ctx.beginPath()
@@ -273,36 +273,43 @@ Panel {
       for (var k = 1; k < pts.length; k++) ctx.lineTo(X(pts[k][0]), Y(pts[k][1]))
       ctx.stroke()
 
-      ctx.lineWidth = 1.5
-      ctx.strokeStyle = css(color, 0.7)
+      ctx.lineWidth = 2
+      ctx.strokeStyle = css(color, 0.75)
       dashLine(ctx, X(ef), Y(now), X(1), Y(a.pace.projectedAtReset), 3, 4)
 
       ctx.fillStyle = css(color)
       ctx.strokeStyle = css(root.surface)
       ctx.lineWidth = 1.5
       ctx.beginPath()
-      ctx.arc(X(ef), Y(now), Style.space(4.5), 0, Math.PI * 2)
+      ctx.arc(X(ef), Y(now), Style.space(5.5), 0, Math.PI * 2)
       ctx.fill()
       ctx.stroke()
 
-      ctx.font = canvasFont(true)
-      ctx.textAlign = "center"
-      ctx.fillText(pct(now), X(ef), Math.max(fs / 2, Y(now) - Style.space(12)))
-      labels.push({ y: Y(a.pace.projectedAtReset) - Style.space(9), text: a.name + " → ~" + pct(a.pace.projectedAtReset), color: color })
+      ctx.font = canvasFont(true, fs)
+      // Late in the window the right edge belongs to the projection labels,
+      // so the current value moves to the left of its dot.
+      if (ef > 0.75) {
+        ctx.textAlign = "right"
+        ctx.fillText(pct(now), X(ef) - Style.space(10), root.clamp(Y(now), fs / 2, top + ph - fs / 2))
+      } else {
+        ctx.textAlign = "center"
+        ctx.fillText(pct(now), X(ef), Math.max(fs / 2, Y(now) - Style.space(14)))
+      }
+      labels.push({ y: Y(a.pace.projectedAtReset) - Style.space(12), text: a.name + " → ~" + pct(a.pace.projectedAtReset), color: color })
     }
 
     // Projection labels at the right edge, nudged apart when they meet.
     labels.sort(function(p, q) { return p.y - q.y })
     for (var l = 0; l < labels.length; l++) {
       labels[l].y = root.clamp(labels[l].y, fs / 2, top + ph - fs / 2)
-      if (l > 0 && labels[l].y - labels[l - 1].y < fs + 3) labels[l].y = labels[l - 1].y + fs + 3
-      ctx.font = canvasFont(true)
+      if (l > 0 && labels[l].y - labels[l - 1].y < fs + 4) labels[l].y = labels[l - 1].y + fs + 4
+      ctx.font = canvasFont(true, fs)
       ctx.textAlign = "right"
       ctx.fillStyle = css(labels[l].color)
       ctx.fillText(labels[l].text, X(1) - Style.space(2), labels[l].y)
     }
 
-    ctx.font = canvasFont(false)
+    ctx.font = canvasFont(false, fs)
     ctx.fillStyle = css(root.foreground, 0.4)
     ctx.textAlign = "left"
     ctx.fillText("window start", X(0), h - fs / 2 - 1)
@@ -614,6 +621,44 @@ Panel {
     return rows.slice(0, 4)
   }
 
+  // Tokens per model inside each account's current weekly window, one column
+  // per account plus the total, busiest model first. Models too small to read
+  // at this scale drop out of the rows but still count in the totals.
+  function windowModels(index) {
+    var raw = accounts[index].windowModelTokens || {}
+    var out = {}
+    for (var id in raw) {
+      var name = usage.friendlyModelName(id)
+      out[name] = (out[name] || 0) + Number(raw[id] || 0)
+    }
+    return out
+  }
+
+  function modelBreakdown() {
+    var byModel = {}
+    var grand = 0
+    for (var i = 0; i < accounts.length; i++) {
+      var models = windowModels(i)
+      for (var name in models) {
+        if (!byModel[name]) {
+          byModel[name] = { name: name, total: 0, perAccount: [] }
+          for (var k = 0; k < accounts.length; k++) byModel[name].perAccount.push(0)
+        }
+        byModel[name].perAccount[i] += models[name]
+        byModel[name].total += models[name]
+        grand += models[name]
+      }
+    }
+    var out = []
+    for (var id in byModel) if (byModel[id].total >= grand * 0.001) out.push(byModel[id])
+    out.sort(function(a, b) { return b.total - a.total })
+    return out
+  }
+
+  function accountTokenTotal(index) {
+    return Number(accounts[index].tokensInWindow || 0)
+  }
+
   function modelTooltip(row) {
     if (!row) return ""
     return "In " + usage.formatTokenCount(row.input)
@@ -721,7 +766,9 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(380))
+    // The accounts view lays its tiles, charts and model table side by side,
+    // so it gets room to breathe; other providers keep the stock width.
+    contentWidth: panel.fittedContentWidth(Style.space(root.isClaude ? 560 : 380))
     // Taller than the control panels on purpose: this one is a dashboard, and
     // the whole point is reading limits and history without scrolling.
     // The accounts view is a dashboard meant to be read whole; only the screen
@@ -937,7 +984,7 @@ Panel {
             Canvas {
               id: paceChart
               width: parent.width
-              height: Style.space(180)
+              height: Style.space(280)
               property var series: root.accounts
               onSeriesChanged: requestPaint()
               onWidthChanged: requestPaint()
@@ -1029,19 +1076,22 @@ Panel {
               }
             }
 
+            PanelSeparator { foreground: root.foreground }
+
+            PanelSectionHeader {
+              text: "TOKENS BY MODEL · THIS WINDOW"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            ModelTable {
+              width: parent.width
+              rows: root.modelBreakdown()
+            }
+
             Flow {
               width: parent.width
               spacing: Style.space(6)
-
-              Repeater {
-                model: root.models.slice(0, 3)
-
-                Chip {
-                  required property var modelData
-                  label: modelData.name
-                  value: usage.formatTokenCount(modelData.total)
-                }
-              }
 
               Repeater {
                 model: root.scopedChips()
@@ -1054,57 +1104,14 @@ Panel {
               }
             }
 
-            Item {
+            Text {
               width: parent.width
-              implicitHeight: Math.max(footerButtons.implicitHeight, footerMeta.implicitHeight)
-
-              Row {
-                id: footerButtons
-                anchors.left: parent.left
-                anchors.right: footerMeta.left
-                anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(8)
-
-                readonly property var order: root.launchOrder()
-
-                Repeater {
-                  model: footerButtons.order
-
-                  ActionButton {
-                    required property var modelData
-                    required property int index
-                    width: (footerButtons.width - footerButtons.spacing * (footerButtons.order.length - 1)) / Math.max(1, footerButtons.order.length)
-                    text: "Open " + modelData.name
-                    solid: index === 0
-                    onClicked: root.launchAccount(modelData)
-                  }
-                }
-              }
-
-              Column {
-                id: footerMeta
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-
-                Text {
-                  anchors.right: parent.right
-                  textFormat: Text.PlainText
-                  text: root.ageText(root.limitsAgeMs())
-                  color: root.faint
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                Text {
-                  anchors.right: parent.right
-                  textFormat: Text.PlainText
-                  text: "r refresh"
-                  color: root.faint
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
+              horizontalAlignment: Text.AlignRight
+              textFormat: Text.PlainText
+              text: root.ageText(root.limitsAgeMs()) + " · r refresh"
+              color: root.faint
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
           }
 
@@ -1894,6 +1901,110 @@ Panel {
     }
   }
 
+  // Models down, accounts across, the total last. Each account column wears
+  // that account's color.
+  component ModelTable: Column {
+    id: table
+    property var rows: []
+    readonly property int valueColumns: root.accounts.length + 1
+    readonly property real nameWidth: width * 0.34
+    readonly property real valueWidth: (width - nameWidth) / valueColumns
+    spacing: Style.space(2)
+
+    Row {
+      Item { width: table.nameWidth; height: 1 }
+      Repeater {
+        model: table.valueColumns
+        Text {
+          required property int index
+          readonly property bool isTotal: index === root.accounts.length
+          width: table.valueWidth
+          horizontalAlignment: Text.AlignRight
+          textFormat: Text.PlainText
+          text: isTotal ? "Total" : root.accounts[index].name
+          color: isTotal ? root.dim : root.accountColor(index)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          elide: Text.ElideRight
+          bottomPadding: Style.space(4)
+        }
+      }
+    }
+
+    Repeater {
+      model: table.rows
+
+      Column {
+        id: modelRow
+        required property var modelData
+        width: table.width
+        topPadding: Style.space(3)
+        bottomPadding: Style.space(3)
+
+        Row {
+          Text {
+            width: table.nameWidth
+            textFormat: Text.PlainText
+            text: modelRow.modelData.name
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+          Repeater {
+            model: table.valueColumns
+            Text {
+              required property int index
+              readonly property bool isTotal: index === root.accounts.length
+              readonly property real value: isTotal ? modelRow.modelData.total : modelRow.modelData.perAccount[index]
+              width: table.valueWidth
+              horizontalAlignment: Text.AlignRight
+              textFormat: Text.PlainText
+              text: value > 0 ? usage.formatTokenCount(value) : "—"
+              color: isTotal ? root.foreground : (value > 0 ? root.dim : root.faint)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: isTotal
+            }
+          }
+        }
+      }
+    }
+
+    Row {
+      topPadding: Style.space(4)
+      Text {
+        width: table.nameWidth
+        textFormat: Text.PlainText
+        text: "All models"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+      Repeater {
+        model: table.valueColumns
+        Text {
+          required property int index
+          readonly property bool isTotal: index === root.accounts.length
+          width: table.valueWidth
+          horizontalAlignment: Text.AlignRight
+          textFormat: Text.PlainText
+          text: {
+            if (!isTotal) return usage.formatTokenCount(root.accountTokenTotal(index))
+            var sum = 0
+            for (var i = 0; i < root.accounts.length; i++) sum += root.accountTokenTotal(i)
+            return usage.formatTokenCount(sum)
+          }
+          color: isTotal ? root.foreground : root.accountColor(index)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+        }
+      }
+    }
+  }
+
   component Chip: Rectangle {
     id: chip
     property string label: ""
@@ -1926,42 +2037,6 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
       }
-    }
-  }
-
-  component ActionButton: Rectangle {
-    id: action
-    property string text: ""
-    property bool solid: false
-    signal clicked()
-
-    implicitHeight: actionLabel.implicitHeight + Style.space(18)
-    radius: Math.max(Style.cornerRadius, Style.space(5))
-    color: solid ? (actionMouse.containsMouse ? Qt.lighter(root.accent, 1.12) : root.accent)
-      : (actionMouse.containsMouse ? root.alpha(root.foreground, 0.08) : "transparent")
-    border.width: solid ? 0 : 1
-    border.color: root.alpha(root.foreground, 0.25)
-
-    Text {
-      id: actionLabel
-      anchors.centerIn: parent
-      width: parent.width - Style.space(8)
-      horizontalAlignment: Text.AlignHCenter
-      textFormat: Text.PlainText
-      text: action.text
-      color: action.solid ? root.surface : root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      font.bold: true
-      elide: Text.ElideRight
-    }
-
-    MouseArea {
-      id: actionMouse
-      anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onClicked: action.clicked()
     }
   }
 }
