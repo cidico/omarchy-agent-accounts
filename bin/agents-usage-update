@@ -497,16 +497,26 @@ def pace(weekly: dict[str, Any] | None, history: Path, fetched_at: dt.datetime |
   }
 
 
-def scan_window(projects: Path, start: dt.datetime) -> dict[str, int]:
-  """Tokens per model in Claude Code transcripts stamped at or after `start`.
+def last_window_percent(history: Path, resets: dt.datetime) -> float | None:
+  """The weekly share the log last saw for the window that reset at `resets`.
 
-  The stock collector only buckets by calendar day, and a weekly window opens
-  mid-day (sex 15:59), so the reset's own day would land wholly on one side.
-  Only files touched since the window opened can hold its messages.
+  Usage only grows inside a window, so the highest reading is the latest one;
+  anything spent after the last probe is missing, which makes it a floor.
   """
+  values = [value for _, value, reset in history_points(history)
+            if reset and abs((reset - resets).total_seconds()) <= 600]
+  return round(max(values), 4) if values else None
+
+
+def month_start(now: dt.datetime) -> dt.datetime:
+  local = now.astimezone()
+  return local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def transcript_messages(projects: Path, start: dt.datetime):
+  """(time, model, tokens) for each assistant message stamped at or after `start`."""
   floor = start.timestamp()
   seen: set[str] = set()
-  by_model: dict[str, int] = {}
   for path in projects.rglob("*.jsonl") if projects.is_dir() else []:
     try:
       if path.stat().st_mtime < floor:
@@ -534,30 +544,78 @@ def scan_window(projects: Path, start: dt.datetime) -> dict[str, int]:
           model = str(message.get("model") or "unknown")
           if model == "<synthetic>":
             continue
-          by_model[model] = by_model.get(model, 0) + sum(int(number(usage.get(field))) for field in (
+          yield when, model, sum(int(number(usage.get(field))) for field in (
             "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
     except OSError:
       continue
-  return by_model
 
 
-def window_tokens(account: dict[str, Any], recent_days: list[dict[str, Any]], window_start_ms: int, reuse: bool) -> dict[str, Any]:
-  if not window_start_ms:
-    return {"tokensInWindow": 0, "tokensPreviousWindow": 0, "windowModelTokens": {}}
-  cache = WORK_ROOT / account["id"] / "window.json"
+def scan_periods(projects: Path, window_start: dt.datetime | None, now: dt.datetime) -> dict[str, Any]:
+  """Tokens per model in this weekly window, the one before it and this month,
+  plus tokens per local calendar day of this month, from one pass.
+
+  The stock collector only buckets by calendar day and only keeps a week, and
+  a weekly window opens mid-day (sex 15:59), so the reset's own day would land
+  wholly on one side. Only files touched since the earliest period opened can
+  hold its messages.
+  """
+  month = month_start(now)
+  previous = window_start - dt.timedelta(seconds=WEEK) if window_start else None
+  start = min(month, previous) if previous else month
+  periods: dict[str, dict[str, int]] = {"window": {}, "previousWindow": {}, "month": {}}
+  days: dict[str, int] = {}
+
+  def add(bucket: dict[str, int], model: str, tokens: int) -> None:
+    bucket[model] = bucket.get(model, 0) + tokens
+
+  for when, model, tokens in transcript_messages(projects, start):
+    if when >= month:
+      add(periods["month"], model, tokens)
+      day = when.astimezone().strftime("%Y-%m-%d")
+      days[day] = days.get(day, 0) + tokens
+    if window_start and when >= window_start:
+      add(periods["window"], model, tokens)
+    elif previous and when >= previous:
+      add(periods["previousWindow"], model, tokens)
+  return {"periods": periods, "monthDays": days}
+
+
+def period_tokens(account: dict[str, Any], account_pace: dict[str, Any] | None, history: Path,
+                  now: dt.datetime, reuse: bool) -> dict[str, Any]:
+  window_start_ms = account_pace["windowStartMs"] if account_pace else 0
+  month_key = month_start(now).strftime("%Y-%m")
+  cache = WORK_ROOT / account["id"] / "periods.json"
   cached = read_json(cache)
-  fresh = (isinstance(cached, dict) and isinstance(cached.get("byModel"), dict)
+  fresh = (isinstance(cached, dict) and isinstance(cached.get("periods"), dict)
+           and cached.get("month") == month_key
            and abs(int(number(cached.get("windowStartMs"))) - window_start_ms) < 600_000)
   if fresh and (reuse or time.time() - cache.stat().st_mtime < 60):
-    by_model = {str(k): int(number(v)) for k, v in cached["byModel"].items()}
+    scanned = {"periods": cached["periods"], "monthDays": cached.get("monthDays") or {}}
   else:
-    start = dt.datetime.fromtimestamp(window_start_ms / 1000, dt.timezone.utc)
-    by_model = scan_window(account["dir"] / "projects", start)
-    write_atomic(cache, json.dumps({"windowStartMs": window_start_ms, "byModel": by_model}) + "\n")
-  inside = sum(by_model.values())
-  # The rest of the visible week belongs to the window before the reset.
-  week = sum(int(number(day.get("messageCount"))) for day in recent_days)
-  return {"tokensInWindow": inside, "tokensPreviousWindow": max(0, week - inside), "windowModelTokens": by_model}
+    start = dt.datetime.fromtimestamp(window_start_ms / 1000, dt.timezone.utc) if window_start_ms else None
+    scanned = scan_periods(account["dir"] / "projects", start, now)
+    write_atomic(cache, json.dumps({"windowStartMs": window_start_ms, "month": month_key, **scanned}) + "\n")
+
+  by_period = {name: {str(k): int(number(v)) for k, v in (scanned["periods"].get(name) or {}).items()}
+               for name in ("window", "previousWindow", "month")}
+  periods: dict[str, Any] = {}
+  if window_start_ms:
+    week_ms = WEEK * 1000
+    periods["window"] = {"startMs": window_start_ms, "endMs": window_start_ms + week_ms,
+                         "byModel": by_period["window"]}
+    resets = dt.datetime.fromtimestamp(window_start_ms / 1000, dt.timezone.utc)
+    periods["previousWindow"] = {"startMs": window_start_ms - week_ms, "endMs": window_start_ms,
+                                 "byModel": by_period["previousWindow"],
+                                 "finalPercent": last_window_percent(history, resets)}
+  periods["month"] = {"startMs": ms(month_start(now)), "endMs": ms(now), "byModel": by_period["month"]}
+  return {
+    "tokensInWindow": sum(by_period["window"].values()),
+    "tokensPreviousWindow": sum(by_period["previousWindow"].values()),
+    "tokensInMonth": sum(by_period["month"].values()),
+    "windowModelTokens": by_period["window"],
+    "periods": periods,
+    "monthDays": [{"date": day, "tokens": int(number(count))} for day, count in sorted(scanned["monthDays"].items())],
+  }
 
 
 # ------------------------------------------------------------------- record
@@ -609,7 +667,7 @@ def build_account(account: dict[str, Any], sessions: dict[str, int], args: argpa
     "totalPrompts": int(number(stats.get("totalPrompts"))),
     "_stats": stats,
   }
-  entry.update(window_tokens(account, entry["recentDays"], account_pace["windowStartMs"] if account_pace else 0, args.limits_only))
+  entry.update(period_tokens(account, account_pace, paths["history"], now, args.limits_only))
   return entry
 
 

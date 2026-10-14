@@ -29,10 +29,14 @@ its leftover allowance is not wasted.
 - **Pace this window**: weekly usage against elapsed window time for each account,
   with the recent trend projected to the reset. Under the diagonal leaves headroom;
   over it runs dry before the reset.
-- **Tokens by day**: every account on one chart, with each weekly reset marked
-  where it fell.
-- **Tokens by model**: each model's tokens in every account's current weekly
-  window, with the total across accounts, and model-scoped weekly limits
+- **Tokens by day**: the current month, day 1 to its last, every account on one
+  chart, with each weekly reset (past and upcoming) marked at its hour and
+  weekends shaded. Hover a day for each account's tokens and any reset that day.
+- **Tokens by model**: each model's tokens per account plus the total, for
+  **this window**, **the last window** or **this month** (click the switch or
+  press `p`). Under each account: the span it covers and, for a weekly window,
+  how much of the limit it used (the last window shows the final reading the
+  log took before its reset). Model-scoped weekly limits ride along as chips
   (e.g. `Fable weekly: P 3% · W 21%`).
 
 Codex and Fireworks keep the stock Omarchy view under their own tabs.
@@ -92,8 +96,10 @@ provider, so they are not counted twice.
 - **Local stats**: Omarchy's `omarchy-agent-usage-claude` runs once per account,
   pointed at a shadow config dir that links only `projects/`, `stats-cache.json`
   and `history.jsonl`. It sees no credentials, so it never makes network calls.
-  Tokens spent in the current window are summed from transcript timestamps, not
-  calendar days.
+  Tokens per model in the current and previous weekly windows and in the month,
+  and tokens per day of the month, come from one pass over the transcripts by
+  timestamp, not calendar days, so a window that opens mid-day splits its day
+  correctly.
 - **Limits**: Anthropic's OAuth usage endpoint
   (`https://api.anthropic.com/api/oauth/usage`, the same one Omarchy's collector
   uses), queried at most once every 30 minutes per account. A failure backs off
@@ -139,7 +145,8 @@ It needs `jq`, `curl` and `git`.
 omarchy-shell io.github.cidico.agent-accounts <open|close|toggle|refresh|next>
 ```
 
-In the panel, `h`/`l` switch provider, `j`/`k` scroll, `r` refreshes, `Esc` closes.
+In the panel, `h`/`l` switch provider, `j`/`k` scroll, `p` cycles the model
+table's period, `r` refreshes, `Esc` closes.
 On the bar icon, a left click opens the panel, a right click opens the
 recommended account, and a middle click moves to the next provider.
 

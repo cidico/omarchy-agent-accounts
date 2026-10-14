@@ -184,12 +184,131 @@ Panel {
     return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
-  function windowTokensTooltip() {
-    var parts = []
+  // ---------------------------------------------------------------- periods
+  //
+  // The model table sums one span at a time: each account's current weekly
+  // window, the window before it, or this calendar month.
+
+  readonly property var periodChoices: [
+    { id: "window", label: "This window" },
+    { id: "previousWindow", label: "Last window" },
+    { id: "month", label: "Month" }
+  ]
+  property string period: "window"
+
+  readonly property var monthNames: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  readonly property var monthLongNames: ["January", "February", "March", "April", "May", "June", "July",
+    "August", "September", "October", "November", "December"]
+
+  function periodIndex() {
+    for (var i = 0; i < periodChoices.length; i++) if (periodChoices[i].id === period) return i
+    return 0
+  }
+
+  function cyclePeriod() { period = periodChoices[(periodIndex() + 1) % periodChoices.length].id }
+
+  function accountPeriod(acc, id) {
+    var periods = acc && acc.periods ? acc.periods : {}
+    if (periods[id]) return periods[id]
+    // Records written before periods existed still carry this window.
+    if (id === "window" && acc && acc.windowModelTokens) return { byModel: acc.windowModelTokens }
+    return null
+  }
+
+  function shortDate(ms) {
+    var d = new Date(ms)
+    return monthNames[d.getMonth()] + " " + d.getDate()
+  }
+
+  // "Oct 7–14", or "Sep 30–Oct 7" when the span crosses a month.
+  function rangeText(startMs, endMs) {
+    var a = new Date(startMs), b = new Date(endMs)
+    if (a.getMonth() === b.getMonth()) return shortDate(startMs) + "–" + b.getDate()
+    return shortDate(startMs) + "–" + shortDate(endMs)
+  }
+
+  // Under each account's name in the model table: the span it sums, and for
+  // a weekly window how much of the limit it used (the last window's is the
+  // last reading the log took before its reset).
+  function periodCaption(acc, id) {
+    var p = accountPeriod(acc, id)
+    if (!p || !(p.startMs > 0)) return "—"
+    var text = rangeText(p.startMs, p.endMs)
+    var used = id === "window" ? (acc.weekly ? acc.weekly.percent : null)
+      : (id === "previousWindow" ? p.finalPercent : null)
+    if (used !== null && used !== undefined) text += " · " + pct(used)
+    return text
+  }
+
+  // ------------------------------------------------------------------ month
+
+  // This month's calendar, recomputed from nowMs so a panel left open across
+  // midnight, or into the 1st, moves with the clock.
+  function monthFrame() {
+    var now = new Date(root.nowMs)
+    var y = now.getFullYear(), m = now.getMonth()
+    return {
+      year: y,
+      month: m,
+      days: new Date(y, m + 1, 0).getDate(),
+      today: now.getDate() - 1,
+      startMs: new Date(y, m, 1).getTime(),
+      endMs: new Date(y, m + 1, 1).getTime(),
+      prefix: y + "-" + pad2(m + 1) + "-"
+    }
+  }
+
+  // An account's tokens for each day of the month, day 1 at index 0.
+  function monthValues(acc, frame) {
+    var values = []
+    for (var i = 0; i < frame.days; i++) values.push(0)
+    // Records written before monthDays existed only know the last week.
+    var list = acc.monthDays || (acc.recentDays || []).map(function(d) { return { date: d.date, tokens: d.messageCount } })
+    for (var j = 0; j < list.length; j++) {
+      var date = String(list[j].date || "")
+      if (date.indexOf(frame.prefix) !== 0) continue
+      var day = Number(date.slice(frame.prefix.length)) - 1
+      if (day >= 0 && day < frame.days) values[day] += Number(list[j].tokens || 0)
+    }
+    return values
+  }
+
+  // Every weekly reset of an account that falls inside the month, past and
+  // upcoming, at its hour within its day (`at` counts days from the 1st).
+  function monthResets(acc, frame) {
+    var out = []
+    var start = acc && acc.pace ? Number(acc.pace.windowStartMs || 0) : 0
+    if (!(start > 0)) return out
+    var week = 7 * 24 * 3600 * 1000
+    for (var t = start - Math.floor((start - frame.startMs) / week) * week; t < frame.endMs; t += week) {
+      var d = new Date(t)
+      out.push({ ms: t, day: d.getDate() - 1, at: d.getDate() - 1 + (d.getHours() + d.getMinutes() / 60) / 24 })
+    }
+    return out
+  }
+
+  function monthDayTooltip(index) {
+    var frame = monthFrame()
+    if (index < 0 || index > frame.today) return ""
+    var date = new Date(frame.year, frame.month, index + 1)
+    var head = (index === frame.today ? "Today" : ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][date.getDay()])
+      + ", " + monthNames[frame.month] + " " + (index + 1)
+    var parts = [head]
+    var sum = 0
     for (var i = 0; i < accounts.length; i++) {
-      var a = accounts[i]
-      parts.push(a.name + ": " + usage.formatTokenCount(a.tokensInWindow || 0) + " this window"
-        + (a.tokensPreviousWindow > 0 ? ", " + usage.formatTokenCount(a.tokensPreviousWindow) + " the window before" : ""))
+      var value = monthValues(accounts[i], frame)[index]
+      sum += value
+      parts.push(accounts[i].name + " " + usage.formatTokenCount(value))
+    }
+    if (accounts.length > 1) parts.push(usage.formatTokenCount(sum) + " total")
+    for (var j = 0; j < accounts.length; j++) {
+      var resets = monthResets(accounts[j], frame)
+      for (var r = 0; r < resets.length; r++) {
+        if (resets[r].day !== index) continue
+        var at = new Date(resets[r].ms)
+        parts.push(accounts[j].name + " reset" + (resets[r].ms > root.nowMs ? "s " : " ")
+          + pad2(at.getHours()) + ":" + pad2(at.getMinutes()))
+      }
     }
     return parts.join(" · ")
   }
@@ -317,38 +436,40 @@ Panel {
     ctx.fillText("reset", X(1), h - fs / 2 - 1)
   }
 
-  // Tokens per calendar day, one line per account, with each account's
-  // weekly reset marked where it fell.
-  function paintDays(ctx, w, h, accts) {
+  // Tokens per day of this month, day 1 to its last, one line per account;
+  // days still ahead stay empty. Each day owns a column, so a weekly reset
+  // lands at its hour inside its day, and weekends read as faint bands.
+  // Returns the plot's geometry so hovering can find the day under the mouse.
+  function paintDays(ctx, w, h, accts, hover) {
     ctx.reset()
     var fs = Style.font.caption
-    var dateSet = {}
-    for (var i = 0; i < accts.length; i++) {
-      var days = accts[i].recentDays || []
-      for (var d = 0; d < days.length; d++) dateSet[String(days[d].date)] = true
-    }
-    var dates = Object.keys(dateSet).sort().slice(-7)
-    var n = dates.length
-    if (n === 0) return
+    var frame = monthFrame()
+    var n = frame.days
+    var last = frame.today
 
     var peak = 1
     var series = []
     for (var a = 0; a < accts.length; a++) {
-      var byDate = {}
-      var list = accts[a].recentDays || []
-      for (var j = 0; j < list.length; j++) byDate[String(list[j].date)] = Number(list[j].messageCount || 0)
-      var values = dates.map(function(date) { return byDate[date] || 0 })
-      for (var v = 0; v < values.length; v++) peak = Math.max(peak, values[v])
+      var values = monthValues(accts[a], frame)
+      for (var v = 0; v <= last; v++) peak = Math.max(peak, values[v])
       series.push(values)
     }
 
     ctx.font = canvasFont(false)
     var peakLabel = usage.formatTokenCount(peak)
     var left = Math.max(Style.space(30), ctx.measureText(peakLabel).width + Style.space(10))
-    var right = Style.space(14), top = Style.space(8), bottom = Style.space(22)
+    var right = Style.space(8), top = Style.space(10), bottom = Style.space(22)
     var pw = Math.max(1, w - left - right), ph = Math.max(1, h - top - bottom)
-    function X(idx) { return left + (n === 1 ? pw / 2 : pw * root.clamp(idx, 0, n - 1) / (n - 1)) }
+    function T(days) { return left + pw * root.clamp(days, 0, n) / n }
+    function X(idx) { return T(idx + 0.5) }
     function Y(val) { return top + ph * (1 - val / peak) }
+
+    for (var e = 0; e < n; e++) {
+      var weekday = new Date(frame.year, frame.month, e + 1).getDay()
+      if (weekday !== 0 && weekday !== 6) continue
+      ctx.fillStyle = css(root.foreground, 0.035)
+      ctx.fillRect(T(e), top, pw / n, ph)
+    }
 
     ctx.textBaseline = "middle"
     ctx.lineWidth = 1
@@ -361,14 +482,40 @@ Panel {
     ctx.fillText("0", left - Style.space(6), Y(0))
     ctx.fillText(peakLabel, left - Style.space(6), Y(peak))
 
+    // Resets first, so the lines run over them. Ones still ahead are fainter.
+    for (var r = 0; r < accts.length; r++) {
+      var resetColor = accountColor(r)
+      var resets = monthResets(accts[r], frame)
+      for (var k = 0; k < resets.length; k++) {
+        var x = T(resets[k].at)
+        var ahead = resets[k].ms > root.nowMs
+        ctx.strokeStyle = css(resetColor, ahead ? 0.3 : 0.55)
+        ctx.lineWidth = 1
+        dashLine(ctx, x, top, x, Y(0), 2, 3)
+        ctx.fillStyle = css(resetColor, ahead ? 0.45 : 0.85)
+        ctx.beginPath()
+        ctx.moveTo(x - Style.space(3.5), top - Style.space(6))
+        ctx.lineTo(x + Style.space(3.5), top - Style.space(6))
+        ctx.lineTo(x, top)
+        ctx.closePath()
+        ctx.fill()
+      }
+    }
+
+    if (hover >= 0) {
+      ctx.strokeStyle = css(root.foreground, 0.28)
+      ctx.lineWidth = 1
+      ctx.beginPath(); ctx.moveTo(X(hover), top); ctx.lineTo(X(hover), Y(0)); ctx.stroke()
+    }
+
     for (var s = 0; s < series.length; s++) {
       var color = accountColor(s)
       var vals = series[s]
       ctx.fillStyle = css(color, 0.12)
       ctx.beginPath()
       ctx.moveTo(X(0), Y(0))
-      for (var p = 0; p < n; p++) ctx.lineTo(X(p), Y(vals[p]))
-      ctx.lineTo(X(n - 1), Y(0))
+      for (var p = 0; p <= last; p++) ctx.lineTo(X(p), Y(vals[p]))
+      ctx.lineTo(X(last), Y(0))
       ctx.closePath()
       ctx.fill()
 
@@ -378,45 +525,40 @@ Panel {
       ctx.lineCap = "round"
       ctx.beginPath()
       ctx.moveTo(X(0), Y(vals[0]))
-      for (var q = 1; q < n; q++) ctx.lineTo(X(q), Y(vals[q]))
+      for (var q = 1; q <= last; q++) ctx.lineTo(X(q), Y(vals[q]))
       ctx.stroke()
 
-      ctx.fillStyle = css(color)
-      ctx.strokeStyle = css(root.surface)
-      ctx.lineWidth = 1.5
-      ctx.beginPath()
-      ctx.arc(X(n - 1), Y(vals[n - 1]), Style.space(3), 0, Math.PI * 2)
-      ctx.fill()
-      ctx.stroke()
-
-      // The day each weekly window opened, at its hour within that day.
-      var pace = accts[s].pace
-      if (pace && pace.windowStartMs > 0) {
-        var start = new Date(pace.windowStartMs)
-        var key = start.getFullYear() + "-" + pad2(start.getMonth() + 1) + "-" + pad2(start.getDate())
-        var at = dates.indexOf(key)
-        if (at >= 0) {
-          var x = X(at + (start.getHours() + start.getMinutes() / 60) / 24)
-          ctx.strokeStyle = css(color, 0.55)
-          ctx.lineWidth = 1
-          dashLine(ctx, x, top, x, Y(0), 2, 3)
-          ctx.font = canvasFont(false)
-          ctx.fillStyle = css(color, 0.85)
-          ctx.textAlign = x > left + pw - Style.space(40) ? "right" : "left"
-          ctx.fillText("reset", x + (ctx.textAlign === "left" ? 3 : -3), top + fs / 2)
-        }
+      var marks = hover >= 0 && hover !== last ? [last, hover] : [last]
+      for (var m = 0; m < marks.length; m++) {
+        ctx.fillStyle = css(color)
+        ctx.strokeStyle = css(root.surface)
+        ctx.lineWidth = 1.5
+        ctx.beginPath()
+        ctx.arc(X(marks[m]), Y(vals[marks[m]]), Style.space(3), 0, Math.PI * 2)
+        ctx.fill()
+        ctx.stroke()
       }
     }
 
-    var names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-    var today = root.todayDate()
+    // Day numbers every five days, and "Today" where the lines end; a number
+    // that would touch it gives way.
+    ctx.textAlign = "center"
+    ctx.font = canvasFont(true)
+    var todayHalf = ctx.measureText("Today").width / 2
+    ctx.font = canvasFont(false)
     for (var t = 0; t < n; t++) {
-      var isToday = dates[t] === today
-      ctx.font = canvasFont(isToday)
-      ctx.fillStyle = isToday ? css(root.foreground) : css(root.foreground, 0.4)
-      ctx.textAlign = "center"
-      ctx.fillText(isToday ? "Today" : names[new Date(dates[t] + "T00:00:00").getDay()], X(t), h - fs / 2 - 1)
+      if (t === last || (t !== 0 && (t + 1) % 5 !== 0)) continue
+      var label = String(t + 1)
+      if (Math.abs(X(t) - X(last)) < todayHalf + ctx.measureText(label).width / 2 + Style.space(4)) continue
+      ctx.fillStyle = css(root.foreground, 0.4)
+      ctx.fillText(label, X(t), h - fs / 2 - 1)
     }
+    ctx.font = canvasFont(true)
+    ctx.fillStyle = css(root.foreground)
+    ctx.textAlign = X(last) - todayHalf < left ? "left" : (X(last) + todayHalf > w ? "right" : "center")
+    ctx.fillText("Today", ctx.textAlign === "left" ? left : (ctx.textAlign === "right" ? w : X(last)), h - fs / 2 - 1)
+
+    return { left: left, width: pw, days: n, last: last }
   }
 
   function selectProvider(index) {
@@ -621,11 +763,12 @@ Panel {
     return rows.slice(0, 4)
   }
 
-  // Tokens per model inside each account's current weekly window, one column
-  // per account plus the total, busiest model first. Models too small to read
-  // at this scale drop out of the rows but still count in the totals.
-  function windowModels(index) {
-    var raw = accounts[index].windowModelTokens || {}
+  // Tokens per model inside each account's span for the selected period, one
+  // column per account plus the total, busiest model first. Models too small
+  // to read at this scale drop out of the rows but still count in the totals.
+  function periodModels(index) {
+    var p = accountPeriod(accounts[index], period)
+    var raw = p ? (p.byModel || {}) : {}
     var out = {}
     for (var id in raw) {
       var name = usage.friendlyModelName(id)
@@ -638,7 +781,7 @@ Panel {
     var byModel = {}
     var grand = 0
     for (var i = 0; i < accounts.length; i++) {
-      var models = windowModels(i)
+      var models = periodModels(i)
       for (var name in models) {
         if (!byModel[name]) {
           byModel[name] = { name: name, total: 0, perAccount: [] }
@@ -656,7 +799,10 @@ Panel {
   }
 
   function accountTokenTotal(index) {
-    return Number(accounts[index].tokensInWindow || 0)
+    var models = periodModels(index)
+    var sum = 0
+    for (var name in models) sum += models[name]
+    return sum
   }
 
   function modelTooltip(row) {
@@ -791,7 +937,10 @@ Panel {
       onActivateRequested: root.refreshNow()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "r" || t === "R") root.refreshNow() }
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") root.refreshNow()
+        else if ((t === "p" || t === "P") && root.isClaude) root.cyclePeriod()
+      }
 
       Flickable {
         id: panelFlick
@@ -1012,7 +1161,7 @@ Panel {
                 id: tokensHeader
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: "TOKENS BY DAY"
+                text: "TOKENS BY DAY · " + root.monthLongNames[new Date(root.nowMs).getMonth()].toUpperCase()
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
@@ -1053,35 +1202,75 @@ Panel {
             Canvas {
               id: dayChart
               width: parent.width
-              height: Style.space(116)
+              height: Style.space(150)
               property var series: root.accounts
               property string today: root.todayDate()
+              property int hoverDay: -1
+              property var layout: null
               onSeriesChanged: requestPaint()
               onTodayChanged: requestPaint()
+              onHoverDayChanged: requestPaint()
               onWidthChanged: requestPaint()
               onVisibleChanged: if (visible) requestPaint()
-              onPaint: root.paintDays(getContext("2d"), width, height, series)
+              onPaint: layout = root.paintDays(getContext("2d"), width, height, series, hoverDay)
+
+              function dayAt(x) {
+                if (!layout) return -1
+                return root.clamp(Math.floor((x - layout.left) / layout.width * layout.days), 0, layout.last)
+              }
 
               MouseArea {
                 id: dayChartHover
                 anchors.fill: parent
                 hoverEnabled: true
                 acceptedButtons: Qt.NoButton
+                onPositionChanged: function(mouse) { dayChart.hoverDay = dayChart.dayAt(mouse.x) }
+                onExited: dayChart.hoverDay = -1
               }
 
               PanelToolTip {
-                visible: dayChartHover.containsMouse
-                text: root.windowTokensTooltip()
+                visible: dayChartHover.containsMouse && dayChart.hoverDay >= 0
+                delay: 0
+                x: root.clamp(dayChartHover.mouseX - width / 2, 0, Math.max(0, dayChart.width - width))
+                y: -height - Style.space(6)
+                text: root.monthDayTooltip(dayChart.hoverDay)
                 fontFamily: root.fontFamily
               }
             }
 
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "▾ dashed: weekly resets, faint ones still ahead · shaded: weekends · hover a day for its numbers"
+              color: root.faint
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
             PanelSeparator { foreground: root.foreground }
 
-            PanelSectionHeader {
-              text: "TOKENS BY MODEL · THIS WINDOW"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(modelsHeader.implicitHeight, periodSwitch.implicitHeight)
+
+              PanelSectionHeader {
+                id: modelsHeader
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "TOKENS BY MODEL"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              SegmentSwitch {
+                id: periodSwitch
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                labels: root.periodChoices.map(function(choice) { return choice.label })
+                current: root.periodIndex()
+                onPicked: function(index) { root.period = root.periodChoices[index].id }
+              }
             }
 
             ModelTable {
@@ -1108,7 +1297,7 @@ Panel {
               width: parent.width
               horizontalAlignment: Text.AlignRight
               textFormat: Text.PlainText
-              text: root.ageText(root.limitsAgeMs()) + " · r refresh"
+              text: root.ageText(root.limitsAgeMs()) + " · p period · r refresh"
               color: root.faint
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1538,55 +1727,67 @@ Panel {
 
   // Compact segmented switch for the hero's trailing edge: one cell per
   // provider, the current one filled.
-  component ProviderSwitch: Rectangle {
-    visible: root.providers.length > 1
-    implicitWidth: switchRow.implicitWidth + 2
-    implicitHeight: switchRow.implicitHeight + 2
+  // A row of mutually exclusive choices; the parent owns which one is current.
+  component SegmentSwitch: Rectangle {
+    id: segments
+    property var labels: []
+    property int current: 0
+    signal picked(int index)
+
+    implicitWidth: segmentRow.implicitWidth + 2
+    implicitHeight: segmentRow.implicitHeight + 2
     color: "transparent"
     border.width: 1
     border.color: root.alpha(root.foreground, 0.22)
     radius: Math.max(Style.cornerRadius, Style.space(4))
 
     Row {
-      id: switchRow
+      id: segmentRow
       anchors.centerIn: parent
 
       Repeater {
-        model: root.providers
+        model: segments.labels
 
         Rectangle {
-          id: switchCell
+          id: segmentCell
           required property var modelData
           required property int index
-          readonly property bool current: index === root.providerIndex
+          readonly property bool selected: index === segments.current
 
-          implicitWidth: switchLabel.implicitWidth + Style.space(18)
-          implicitHeight: switchLabel.implicitHeight + Style.space(9)
+          implicitWidth: segmentLabel.implicitWidth + Style.space(18)
+          implicitHeight: segmentLabel.implicitHeight + Style.space(9)
           radius: Math.max(Style.cornerRadius - 1, Style.space(3))
-          color: current ? root.alpha(root.foreground, 0.16)
-            : (switchMouse.containsMouse ? root.alpha(root.foreground, 0.06) : "transparent")
+          color: selected ? root.alpha(root.foreground, 0.16)
+            : (segmentMouse.containsMouse ? root.alpha(root.foreground, 0.06) : "transparent")
 
           Text {
-            id: switchLabel
+            id: segmentLabel
             anchors.centerIn: parent
             textFormat: Text.PlainText
-            text: root.shortProviderName(switchCell.modelData.providerName)
-            color: switchCell.current ? root.foreground : root.dim
+            text: String(segmentCell.modelData)
+            color: segmentCell.selected ? root.foreground : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
-            font.bold: switchCell.current
+            font.bold: segmentCell.selected
           }
 
           MouseArea {
-            id: switchMouse
+            id: segmentMouse
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onClicked: root.selectProvider(switchCell.index)
+            onClicked: segments.picked(segmentCell.index)
           }
         }
       }
     }
+  }
+
+  component ProviderSwitch: SegmentSwitch {
+    visible: root.providers.length > 1
+    labels: root.providers.map(function(p) { return root.shortProviderName(p.providerName) })
+    current: root.providerIndex
+    onPicked: function(index) { root.selectProvider(index) }
   }
 
   // One account: badge, weekly ring, 5-hour session bar, and the numbers
@@ -1907,7 +2108,7 @@ Panel {
     id: table
     property var rows: []
     readonly property int valueColumns: root.accounts.length + 1
-    readonly property real nameWidth: width * 0.34
+    readonly property real nameWidth: width * 0.28
     readonly property real valueWidth: (width - nameWidth) / valueColumns
     spacing: Style.space(2)
 
@@ -1927,6 +2128,24 @@ Panel {
           font.pixelSize: Style.font.bodySmall
           font.bold: true
           elide: Text.ElideRight
+        }
+      }
+    }
+
+    Row {
+      Item { width: table.nameWidth; height: 1 }
+      Repeater {
+        model: root.accounts
+        Text {
+          required property var modelData
+          width: table.valueWidth
+          horizontalAlignment: Text.AlignRight
+          textFormat: Text.PlainText
+          text: root.periodCaption(modelData, root.period)
+          color: root.faint
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideLeft
           bottomPadding: Style.space(4)
         }
       }
